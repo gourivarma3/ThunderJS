@@ -66,7 +66,7 @@ The northbound interface is the JavaScript API consumed by application code: the
 
 The library relies solely on the WebSocket protocol as its IPC mechanism. In a browser runtime, the native `WebSocket` API is used. In a Node.js environment, the `ws` npm package provides the equivalent interface. The build system enforces this distinction through an alias plugin that substitutes the correct WebSocket implementation at bundle time. The WebSocket connection uses the `notification` subprotocol by default, signalling to Thunder that the client intends to both send requests and receive event notifications on the same connection.
 
-State is held entirely in memory. The `requestsQueue` and `listeners` stores are plain in-memory JavaScript objects scoped to the lifetime of the library instance.
+State is held entirely in memory. The `requestsQueue` and `listeners` stores are plain in-memory JavaScript objects exported as module-level singletons from `src/store.js`. They are shared by every `API` and `listener` instance created from the same loaded module — including multiple `ThunderJS(options)` factory calls, such as connections to different hosts — rather than being scoped per library instance. Listener keys (`client.{plugin}.events.{event}`) do not include the server address, so instances connecting to different Thunder endpoints share the same listener namespace.
 
 ```mermaid
 graph TD
@@ -138,8 +138,8 @@ graph TD
 
 #### Platform and Integration Requirements
 
-- **Build Dependencies**: Requires the `wpeframework` package to be present on the target device. The `ws` npm package (`^7.2.3`) is bundled into the CommonJS output for Node.js environments. Browser builds alias `ws` to the native `WebSocket` global.
-- **Plugin Dependencies**: The WPEFramework daemon must be running and its JSON-RPC WebSocket endpoint must be reachable at the configured address before any ThunderJS API calls are issued.
+- **Build Dependencies**: The `ws` npm package (`^7.2.3`) is a declared package dependency that provides the WebSocket client for Node.js. Rollup's alias plugin substitutes the native `WebSocket` global for `ws` when building the browser IIFE (`dist/thunderJS.js`) and ESM (`module/thunderJS.js`) outputs, so the real `ws` package is not bundled into those files. The CommonJS output (`dist/thunderJS.cjs`) marks `ws` as external instead of bundling it, so it is resolved via `require('ws')` at runtime — deploying only that file to a Node.js device without also installing `ws` will fail to load.
+- **Runtime Requirements**: These are platform/runtime requirements, not JavaScript build-time dependencies. The WPEFramework (Thunder) daemon, including the `wpeframework` service, must be present and running on the target device, and its JSON-RPC WebSocket endpoint must be reachable at the configured address before any ThunderJS API calls are issued.
 - **Startup Order**: ThunderJS establishes its WebSocket connection lazily on the first API call; the WPEFramework endpoint must be reachable at that point.
 
 ---
@@ -198,7 +198,7 @@ sequenceDiagram
 **Context Switching Scenarios:**
 
 - **One-shot listener auto-disposal**: A listener registered with `once()` automatically calls `dispose()` after the first invocation of its callback, removing itself from the store and sending `unregister` to Thunder if it was the last subscriber.
-- **Socket reconnection**: After a WebSocket error, the socket pool entry is cleared and the next `call()` or `on()` operation creates a fresh WebSocket connection. Any event subscriptions needed after reconnection are re-registered by the caller.
+- **Socket reconnection**: After a WebSocket error, the socket pool entry is cleared, but the `listeners` store is left intact. The next `call()` or `on()` operation creates a fresh WebSocket connection, but this is not itself a request — `register` is only sent to Thunder when `listeners[listener_id]` does not yet exist. Since a prior subscription's callback array is still present, calling `on()` again for an already-subscribed plugin-event pair merely appends another callback locally and never sends `api.request()`, so the server-side subscription is not restored. To resume notifications after a reconnect, the caller must explicitly `dispose()` the existing listener(s) for that pair and then call `on()`/`once()` again, which will find no remaining listeners and trigger a fresh `register` request.
 
 ---
 
@@ -362,7 +362,7 @@ sequenceDiagram
   - Notification dispatch: `src/api/notificationListener.js`
   - Response resolution: `src/api/requestQueueResolver.js`
 
-- **Listener Lifecycle**: `listener.js` constructs a structured key of the form `client.{plugin}.events.{event}` for each plugin-event pair. The first `on()` call for a pair sends a `register` request to Thunder using the truncated key `client.{plugin}.events` as the JSON-RPC request ID and the event name as a parameter. Callbacks are stored as an array under the full key. `dispose()` removes the callback by index; when the array is empty, `unregister` is sent to Thunder and the key is deleted from the store.
+- **Listener Lifecycle**: `listener.js` constructs a structured key of the form `client.{plugin}.events.{event}` for each plugin-event pair. The first `on()` call for a pair sends a `register` request to Thunder with the truncated key `client.{plugin}.events` passed as `params.id` — a notification-subscription identifier, not the top-level JSON-RPC envelope `id` — alongside the event name as `params.event`. The envelope's `id` field is still a numeric value assigned by `makeId()` in `src/api.js`/`makeBody.js` and used for response correlation via `requestsQueue`, independent of the notification identifier. Callbacks are stored as an array under the full key. `dispose()` removes the callback by index; when the array is empty, `unregister` is sent to Thunder (with the same `params.id`) and the key is deleted from the store.
   - Subscription management: `src/listener.js`
 
 - **Proxy Wrapper**: The factory wraps the core object in a JavaScript `Proxy`. Property access for known keys (`api`, `on`, `once`, `subscribe`) is returned directly. For methods defined on a registered plugin object (and `call()`), the proxy routes the invocation through the `resolve()` helper, which ensures Promise semantics regardless of whether the called method returns synchronously, as a Promise, or as an `Error`, and delivers the result to a trailing callback when one is passed. For dynamically generated methods (properties not pre-registered), the proxy returns a function that invokes `api.request()` with the plugin name (derived from the property chain) and method name directly, bypassing `resolve()`; these calls return the `api.request()` Promise and do not invoke a trailing callback.
